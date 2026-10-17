@@ -3,10 +3,18 @@ import multer from "multer";
 import { Package } from "../models/Package.js";
 import { PackageVersion } from "../models/PackageVersion.js";
 import { uploadTarballToDrive, downloadTarballFromDrive } from "../services/googleDrive.js";
+import { createTgz, cleanPath, extractTgz, isBinary } from "../services/tarball.js";
 import { authenticateToken, optionalAuthenticateToken } from "../middleware/auth.js";
 
 const router = Router();
-const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB max limit
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB max, per file and for a whole package
+const upload = multer({
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 5000, fieldSize: 5 * 1024 * 1024 }
+});
+const publishUpload = upload.fields([
+  { name: "file", maxCount: 1 }, // a ready-made .tgz
+  { name: "files", maxCount: 5000 } // loose files / a folder, packed into a .tgz here
+]);
 
 // GET /api/registry/search - Search packages
 router.get("/search", async (req, res) => {
@@ -143,8 +151,73 @@ router.get("/:name/-/:file", async (req, res) => {
   }
 });
 
+// Unpacked tarballs, keyed by Drive file id, so browsing a package's code doesn't
+// re-download the archive for every file opened. Oldest entries are evicted first.
+const extractedCache = new Map();
+const EXTRACTED_CACHE_SIZE = 20;
+const MAX_VIEWABLE_BYTES = 512 * 1024;
+
+async function getVersionFiles(name, version) {
+  const pkg = await Package.findOne({ name: name.toLowerCase() });
+  if (!pkg) return null;
+  const v = await PackageVersion.findOne({ package: pkg._id, version });
+  if (!v || !v.driveFileId) return null;
+
+  if (!extractedCache.has(v.driveFileId)) {
+    const files = extractTgz(await downloadTarballFromDrive(v.driveFileId));
+    extractedCache.set(v.driveFileId, files);
+    if (extractedCache.size > EXTRACTED_CACHE_SIZE) {
+      extractedCache.delete(extractedCache.keys().next().value);
+    }
+  }
+  return extractedCache.get(v.driveFileId);
+}
+
+// GET /api/registry/:name/v/:version/files - List every file in a version's tarball
+router.get("/:name/v/:version/files", async (req, res) => {
+  try {
+    const files = await getVersionFiles(req.params.name, req.params.version);
+    if (!files) {
+      return res.status(404).json({ error: "Package version not found." });
+    }
+    return res.json({
+      files: files.map(({ path, buffer }) => ({ path, size: buffer.length }))
+    });
+  } catch (err) {
+    console.error("List files error:", err);
+    return res.status(500).json({ error: err.message || "Failed to read the package's files." });
+  }
+});
+
+// GET /api/registry/:name/v/:version/file?path=src/main.qc - One file's contents
+router.get("/:name/v/:version/file", async (req, res) => {
+  try {
+    const files = await getVersionFiles(req.params.name, req.params.version);
+    if (!files) {
+      return res.status(404).json({ error: "Package version not found." });
+    }
+    const file = files.find(({ path }) => path === req.query.path);
+    if (!file) {
+      return res.status(404).json({ error: `File "${req.query.path}" not found in this version.` });
+    }
+
+    const binary = isBinary(file.buffer);
+    const tooLarge = file.buffer.length > MAX_VIEWABLE_BYTES;
+    return res.json({
+      path: file.path,
+      size: file.buffer.length,
+      binary,
+      tooLarge,
+      content: binary || tooLarge ? null : file.buffer.toString("utf8")
+    });
+  } catch (err) {
+    console.error("Read file error:", err);
+    return res.status(500).json({ error: err.message || "Failed to read the file." });
+  }
+});
+
 // POST /api/registry/publish - Publish package (handles JSON base64 or Multipart form-data file)
-router.post("/publish", optionalAuthenticateToken, upload.single("file"), async (req, res) => {
+router.post("/publish", optionalAuthenticateToken, publishUpload, async (req, res) => {
   try {
     let { name, version, description, keywords, license, repository, homepage, readme, dependencies, fileBase64 } = req.body;
 
@@ -157,8 +230,35 @@ router.post("/publish", optionalAuthenticateToken, upload.single("file"), async 
 
     // Extract file buffer from multipart upload OR base64 payload
     let fileBuffer = Buffer.from("");
-    if (req.file && req.file.buffer) {
-      fileBuffer = req.file.buffer;
+    const tarballUpload = req.files?.file?.[0];
+    const looseFiles = req.files?.files ?? [];
+    if (looseFiles.length) {
+      // Loose files / a folder: `paths` carries each file's relative path, in upload order.
+      let paths = [];
+      try {
+        paths = JSON.parse(req.body.paths || "[]");
+      } catch {
+        return res.status(400).json({ error: "Invalid file paths." });
+      }
+
+      const entries = [];
+      let totalBytes = 0;
+      looseFiles.forEach((file, index) => {
+        const path = cleanPath(paths[index] ?? file.originalname);
+        if (!path) return;
+        totalBytes += file.buffer.length;
+        entries.push({ path, buffer: file.buffer });
+      });
+
+      if (!entries.length) {
+        return res.status(400).json({ error: "No usable files were selected." });
+      }
+      if (totalBytes > MAX_UPLOAD_BYTES) {
+        return res.status(400).json({ error: "The selected files are larger than 100 MB in total." });
+      }
+      fileBuffer = createTgz(entries);
+    } else if (tarballUpload && tarballUpload.buffer) {
+      fileBuffer = tarballUpload.buffer;
     } else if (fileBase64) {
       const cleanBase64 = fileBase64.includes(",") ? fileBase64.split(",")[1] : fileBase64;
       fileBuffer = Buffer.from(cleanBase64, "base64");
