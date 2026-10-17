@@ -2,3 +2,5 @@ node_modules
 .envstorage
 .env
 /.env
+storage
+/storage
