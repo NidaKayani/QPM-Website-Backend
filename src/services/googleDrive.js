@@ -1,6 +1,14 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 
 dotenv.config();
+
+// Without Drive credentials, tarballs are kept on local disk under backend/storage/.
+const LOCAL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../storage");
+const LOCAL_PREFIX = "local_";
+const localPath = (fileId) => path.join(LOCAL_DIR, `${path.basename(fileId)}.tgz`);
 
 /**
  * Google Drive API Service Module for QPM Registry
@@ -47,11 +55,11 @@ export async function uploadTarballToDrive(fileName, buffer) {
   const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
   if (!token) {
-    console.log(`[Google Drive] Credentials not set. Generating mock/local Drive File ID for ${fileName}`);
-    return {
-      id: `drive_file_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-      size: buffer.length
-    };
+    const id = `${LOCAL_PREFIX}${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    await fs.mkdir(LOCAL_DIR, { recursive: true });
+    await fs.writeFile(localPath(id), buffer);
+    console.log(`[Google Drive] Credentials not set. Stored ${fileName} locally as ${id}`);
+    return { id, size: buffer.length };
   }
 
   const metadata = {
@@ -99,8 +107,13 @@ export async function uploadTarballToDrive(fileName, buffer) {
  * Returns Buffer
  */
 export async function downloadTarballFromDrive(fileId) {
+  if (fileId.startsWith(LOCAL_PREFIX)) {
+    return fs.readFile(localPath(fileId));
+  }
+
   const token = await getAccessToken();
 
+  // Old mock ids: the archive was never stored anywhere.
   if (!token || fileId.startsWith("drive_file_")) {
     console.log(`[Google Drive] Serving local placeholder archive for ID ${fileId}`);
     return Buffer.from("");
@@ -122,6 +135,10 @@ export async function downloadTarballFromDrive(fileId) {
  * Deletes a tarball file from Google Drive.
  */
 export async function deleteTarballFromDrive(fileId) {
+  if (fileId.startsWith(LOCAL_PREFIX)) {
+    await fs.rm(localPath(fileId), { force: true });
+    return;
+  }
   const token = await getAccessToken();
   if (!token || fileId.startsWith("drive_file_")) return;
 
