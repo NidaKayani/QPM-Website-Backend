@@ -65,3 +65,74 @@ export function cleanPath(raw) {
   if (segments.some((segment) => IGNORED_SEGMENTS.has(segment))) return null;
   return segments.join("/");
 }
+
+const readString = (block, offset, length) => {
+  const end = block.indexOf(0, offset);
+  return block.toString("utf8", offset, end === -1 || end > offset + length ? offset + length : end);
+};
+
+const readOctal = (block, offset, length) => parseInt(readString(block, offset, length).trim() || "0", 8);
+
+/** Pulls `path=` out of a PAX extended header body. */
+function paxPath(body) {
+  for (const record of body.toString("utf8").split("\n")) {
+    const match = record.match(/^\d+ path=(.*)$/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * Reads the regular files out of a (gzip'd) tarball. The archive's single top-level
+ * folder (`package/` for npm-style tarballs, `repo-branch/` for GitHub's) is stripped.
+ * @param {Buffer} archive
+ * @returns {{ path: string, buffer: Buffer }[]}
+ */
+export function extractTgz(archive) {
+  if (!archive?.length) return [];
+  const tar = archive[0] === 0x1f && archive[1] === 0x8b ? zlib.gunzipSync(archive) : archive;
+
+  const files = [];
+  let offset = 0;
+  let nextName = null;
+
+  while (offset + BLOCK <= tar.length) {
+    const header = tar.subarray(offset, offset + BLOCK);
+    if (header.every((byte) => byte === 0)) break;
+
+    const size = readOctal(header, 124, 12);
+    const type = String.fromCharCode(header[156] || 0x30);
+    const body = tar.subarray(offset + BLOCK, offset + BLOCK + size);
+    offset += BLOCK + Math.ceil(size / BLOCK) * BLOCK;
+
+    if (type === "L") {
+      nextName = readString(body, 0, body.length);
+      continue;
+    }
+    if (type === "x") {
+      nextName = paxPath(body) ?? nextName;
+      continue;
+    }
+    if (type === "g") continue;
+
+    const prefix = readString(header, 345, 155);
+    const name = nextName ?? (prefix ? `${prefix}/${readString(header, 0, 100)}` : readString(header, 0, 100));
+    nextName = null;
+
+    if (type !== "0" && type !== "7") continue; // only regular files
+    const path = cleanPath(name);
+    if (path) files.push({ path, buffer: Buffer.from(body) });
+  }
+
+  // Strip the shared top-level folder, if every file lives under one.
+  const roots = new Set(files.map(({ path }) => (path.includes("/") ? path.split("/")[0] : null)));
+  if (roots.size === 1 && !roots.has(null)) {
+    const [root] = roots;
+    for (const file of files) file.path = file.path.slice(root.length + 1);
+  }
+
+  return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/** Heuristic: a NUL byte in the first 8 KB means binary (same check git uses). */
+export const isBinary = (buffer) => buffer.subarray(0, 8000).includes(0);

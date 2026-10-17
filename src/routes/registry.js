@@ -3,7 +3,7 @@ import multer from "multer";
 import { Package } from "../models/Package.js";
 import { PackageVersion } from "../models/PackageVersion.js";
 import { uploadTarballToDrive, downloadTarballFromDrive } from "../services/googleDrive.js";
-import { createTgz, cleanPath } from "../services/tarball.js";
+import { createTgz, cleanPath, extractTgz, isBinary } from "../services/tarball.js";
 import { authenticateToken, optionalAuthenticateToken } from "../middleware/auth.js";
 
 const router = Router();
@@ -148,6 +148,71 @@ router.get("/:name/-/:file", async (req, res) => {
   } catch (err) {
     console.error("Error serving tarball from Google Drive:", err);
     return res.status(500).json({ error: err.message || "Failed to download package from Google Drive" });
+  }
+});
+
+// Unpacked tarballs, keyed by Drive file id, so browsing a package's code doesn't
+// re-download the archive for every file opened. Oldest entries are evicted first.
+const extractedCache = new Map();
+const EXTRACTED_CACHE_SIZE = 20;
+const MAX_VIEWABLE_BYTES = 512 * 1024;
+
+async function getVersionFiles(name, version) {
+  const pkg = await Package.findOne({ name: name.toLowerCase() });
+  if (!pkg) return null;
+  const v = await PackageVersion.findOne({ package: pkg._id, version });
+  if (!v || !v.driveFileId) return null;
+
+  if (!extractedCache.has(v.driveFileId)) {
+    const files = extractTgz(await downloadTarballFromDrive(v.driveFileId));
+    extractedCache.set(v.driveFileId, files);
+    if (extractedCache.size > EXTRACTED_CACHE_SIZE) {
+      extractedCache.delete(extractedCache.keys().next().value);
+    }
+  }
+  return extractedCache.get(v.driveFileId);
+}
+
+// GET /api/registry/:name/v/:version/files - List every file in a version's tarball
+router.get("/:name/v/:version/files", async (req, res) => {
+  try {
+    const files = await getVersionFiles(req.params.name, req.params.version);
+    if (!files) {
+      return res.status(404).json({ error: "Package version not found." });
+    }
+    return res.json({
+      files: files.map(({ path, buffer }) => ({ path, size: buffer.length }))
+    });
+  } catch (err) {
+    console.error("List files error:", err);
+    return res.status(500).json({ error: err.message || "Failed to read the package's files." });
+  }
+});
+
+// GET /api/registry/:name/v/:version/file?path=src/main.qc - One file's contents
+router.get("/:name/v/:version/file", async (req, res) => {
+  try {
+    const files = await getVersionFiles(req.params.name, req.params.version);
+    if (!files) {
+      return res.status(404).json({ error: "Package version not found." });
+    }
+    const file = files.find(({ path }) => path === req.query.path);
+    if (!file) {
+      return res.status(404).json({ error: `File "${req.query.path}" not found in this version.` });
+    }
+
+    const binary = isBinary(file.buffer);
+    const tooLarge = file.buffer.length > MAX_VIEWABLE_BYTES;
+    return res.json({
+      path: file.path,
+      size: file.buffer.length,
+      binary,
+      tooLarge,
+      content: binary || tooLarge ? null : file.buffer.toString("utf8")
+    });
+  } catch (err) {
+    console.error("Read file error:", err);
+    return res.status(500).json({ error: err.message || "Failed to read the file." });
   }
 });
 
