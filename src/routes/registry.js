@@ -2,11 +2,19 @@ import { Router } from "express";
 import multer from "multer";
 import { Package } from "../models/Package.js";
 import { PackageVersion } from "../models/PackageVersion.js";
-import { uploadTarballToDrive, downloadTarballFromDrive } from "../services/googleDrive.js";
-import { createTgz, cleanPath, extractTgz, isBinary } from "../services/tarball.js";
+import { DownloadStat } from "../models/DownloadStat.js";
+import { uploadTarballToDrive, downloadTarballFromDrive, deleteTarballFromDrive } from "../services/googleDrive.js";
+import { createTgz, cleanPath, extractTgz, isBinary, readPackageMeta } from "../services/tarball.js";
 import { authenticateToken, optionalAuthenticateToken } from "../middleware/auth.js";
 
 const router = Router();
+
+// A version can be deleted and republished under the same number, and stats change
+// constantly, so browsers must revalidate these (a 410 is even cacheable by default).
+const noStore = (req, res, next) => {
+  res.setHeader("Cache-Control", "no-cache");
+  next();
+};
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB max, per file and for a whole package
 const upload = multer({
   limits: { fileSize: MAX_UPLOAD_BYTES, files: 5000, fieldSize: 5 * 1024 * 1024 }
@@ -63,6 +71,62 @@ router.get("/user/my-packages", authenticateToken, async (req, res) => {
     return res.json({ packages });
   } catch (err) {
     return res.status(500).json({ error: err.message || "Failed to fetch user packages." });
+  }
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const utcDay = (date) => date.toISOString().slice(0, 10);
+
+// GET /api/registry/:name/stats - Download stats: last 52 weeks (oldest first) and last 7 days per version
+router.get("/:name/stats", noStore, async (req, res) => {
+  try {
+    const pkg = await Package.findOne({ name: req.params.name.toLowerCase() });
+    if (!pkg) {
+      return res.status(404).json({ error: "Package not found." });
+    }
+
+    const WEEKS = 52;
+    const today = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
+    const start = today - (WEEKS * 7 - 1) * DAY_MS;
+    const rows = await DownloadStat.find({ package: pkg._id, day: { $gte: utcDay(new Date(start)) } });
+
+    const weekly = new Array(WEEKS).fill(0);
+    const versions = {};
+    const lastWeekStart = utcDay(new Date(today - 6 * DAY_MS));
+    for (const { day, version, count } of rows) {
+      const week = Math.floor((Date.parse(day) - start) / (7 * DAY_MS));
+      if (week >= 0 && week < WEEKS) weekly[week] += count;
+      if (day >= lastWeekStart) versions[version] = (versions[version] || 0) + count;
+    }
+
+    return res.json({ weekly, lastWeek: weekly[WEEKS - 1], versions });
+  } catch (err) {
+    console.error("Stats error:", err);
+    return res.status(500).json({ error: err.message || "Failed to load download stats." });
+  }
+});
+
+// GET /api/registry/:name/dependents - Packages whose latest version depends on this one
+router.get("/:name/dependents", noStore, async (req, res) => {
+  try {
+    const name = req.params.name.toLowerCase();
+    const candidates = await PackageVersion.find({ [`dependencies.${name}`]: { $exists: true } })
+      .populate("package", "name latestVersion description");
+
+    const dependents = candidates
+      .filter((v) => v.package && v.package.latestVersion === v.version)
+      .map((v) => ({
+        name: v.package.name,
+        version: v.version,
+        description: v.package.description,
+        range: v.dependencies.get(name)
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return res.json({ dependents });
+  } catch (err) {
+    console.error("Dependents error:", err);
+    return res.status(500).json({ error: err.message || "Failed to load dependents." });
   }
 });
 
@@ -134,9 +198,14 @@ router.get("/:name/-/:file", async (req, res) => {
       return res.status(404).json({ error: "Package version or tarball file not found" });
     }
 
-    // Increment download count
+    // Increment download count, overall and per version per day
     pkg.downloads = (pkg.downloads || 0) + 1;
     await pkg.save();
+    await DownloadStat.updateOne(
+      { package: pkg._id, version, day: utcDay(new Date()) },
+      { $inc: { count: 1 } },
+      { upsert: true }
+    );
 
     // Stream tarball directly from Google Drive
     const tarballBuffer = await downloadTarballFromDrive(v.driveFileId);
@@ -180,7 +249,7 @@ async function getVersionFiles(name, version) {
 }
 
 // GET /api/registry/:name/v/:version/files - List every file in a version's tarball
-router.get("/:name/v/:version/files", async (req, res) => {
+router.get("/:name/v/:version/files", noStore, async (req, res) => {
   try {
     const files = await getVersionFiles(req.params.name, req.params.version);
     if (!files) {
@@ -197,7 +266,7 @@ router.get("/:name/v/:version/files", async (req, res) => {
 });
 
 // GET /api/registry/:name/v/:version/file?path=src/main.qc - One file's contents
-router.get("/:name/v/:version/file", async (req, res) => {
+router.get("/:name/v/:version/file", noStore, async (req, res) => {
   try {
     const files = await getVersionFiles(req.params.name, req.params.version);
     if (!files) {
@@ -221,6 +290,69 @@ router.get("/:name/v/:version/file", async (req, res) => {
     if (err.status) return res.status(err.status).json({ error: err.message });
     console.error("Read file error:", err);
     return res.status(500).json({ error: err.message || "Failed to read the file." });
+  }
+});
+
+const MIME_TYPES = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+  svg: "image/svg+xml", ico: "image/x-icon", pdf: "application/pdf"
+};
+
+// GET /api/registry/:name/v/:version/raw?path=logo.png - A file's raw bytes (images are shown inline)
+router.get("/:name/v/:version/raw", noStore, async (req, res) => {
+  try {
+    const files = await getVersionFiles(req.params.name, req.params.version);
+    const file = files?.find(({ path }) => path === req.query.path);
+    if (!file) {
+      return res.status(404).json({ error: "File not found." });
+    }
+
+    const ext = file.path.split(".").pop().toLowerCase();
+    const type = MIME_TYPES[ext] || (isBinary(file.buffer) ? "application/octet-stream" : "text/plain; charset=utf-8");
+    res.setHeader("Content-Type", type);
+    // Package files are untrusted: never let them run as a page on this origin.
+    res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return res.send(file.buffer);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error("Raw file error:", err);
+    return res.status(500).json({ error: err.message || "Failed to read the file." });
+  }
+});
+
+// DELETE /api/registry/:name - Delete a package, every version, and their stored tarballs (owner only)
+router.delete("/:name", authenticateToken, async (req, res) => {
+  try {
+    const name = req.params.name.toLowerCase();
+    const pkg = await Package.findOne({ name });
+    if (!pkg) {
+      return res.status(404).json({ error: `Package "${name}" not found.` });
+    }
+    if (!pkg.owner || pkg.owner.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: `Only the owner of "${name}" can delete it.` });
+    }
+
+    const versions = await PackageVersion.find({ package: pkg._id });
+    for (const v of versions) {
+      if (!v.driveFileId) continue;
+      extractedCache.delete(v.driveFileId);
+      try {
+        await deleteTarballFromDrive(v.driveFileId);
+      } catch (err) {
+        // A tarball that can't be removed shouldn't block deleting the package record.
+        console.error(`Failed to delete tarball ${v.driveFileId}:`, err);
+      }
+    }
+
+    await PackageVersion.deleteMany({ package: pkg._id });
+    await DownloadStat.deleteMany({ package: pkg._id });
+    await pkg.deleteOne();
+
+    return res.json({ message: `Package "${name}" was deleted.` });
+  } catch (err) {
+    console.error("Delete package error:", err);
+    return res.status(500).json({ error: err.message || "Failed to delete package." });
   }
 });
 
@@ -271,6 +403,13 @@ router.post("/publish", optionalAuthenticateToken, publishUpload, async (req, re
       const cleanBase64 = fileBase64.includes(",") ? fileBase64.split(",")[1] : fileBase64;
       fileBuffer = Buffer.from(cleanBase64, "base64");
     }
+
+    // Fill anything the form left blank from the package's own README and manifest.
+    const meta = readPackageMeta(fileBuffer);
+    readme = readme || meta.readme;
+    description = description || meta.manifest.description || "";
+    if (!keywords || !keywords.length) keywords = meta.manifest.keywords || meta.manifest.tags || keywords;
+    license = license || meta.manifest.license;
 
     if (typeof keywords === "string") {
       keywords = keywords.split(",").map((k) => k.trim()).filter(Boolean);
@@ -415,6 +554,7 @@ router.post("/publish-from-github", optionalAuthenticateToken, async (req, res) 
       });
     }
     const fileBuffer = Buffer.from(await tarballRes.arrayBuffer());
+    if (!readme) readme = readPackageMeta(fileBuffer).readme;
 
     let parsedDeps = {};
     if (typeof dependencies === "string") {

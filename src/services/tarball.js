@@ -136,3 +136,34 @@ export function extractTgz(archive) {
 
 /** Heuristic: a NUL byte in the first 8 KB means binary (same check git uses). */
 export const isBinary = (buffer) => buffer.subarray(0, 8000).includes(0);
+
+/**
+ * Reads the root README and manifest (qpm.json, else package.json) out of a package archive,
+ * so a publish without a typed-in README or description still gets them.
+ * @returns {{ readme: string, manifest: object }}
+ */
+export function readPackageMeta(archive) {
+  let files = [];
+  try {
+    files = extractTgz(archive);
+  } catch {
+    return { readme: "", manifest: {} };
+  }
+
+  const atRoot = (pattern) => files.find(({ path }) => !path.includes("/") && pattern.test(path));
+  const readme = atRoot(/^readme(\.(md|markdown|txt))?$/i);
+
+  let manifest = {};
+  for (const name of [/^qpm\.json$/i, /^package\.json$/i]) {
+    const file = atRoot(name);
+    if (!file) continue;
+    try {
+      manifest = JSON.parse(file.buffer.toString("utf8"));
+      break;
+    } catch {
+      // Malformed manifest: try the next one.
+    }
+  }
+
+  return { readme: readme ? readme.buffer.toString("utf8") : "", manifest };
+}
