@@ -3,10 +3,18 @@ import multer from "multer";
 import { Package } from "../models/Package.js";
 import { PackageVersion } from "../models/PackageVersion.js";
 import { uploadTarballToDrive, downloadTarballFromDrive } from "../services/googleDrive.js";
+import { createTgz, cleanPath } from "../services/tarball.js";
 import { authenticateToken, optionalAuthenticateToken } from "../middleware/auth.js";
 
 const router = Router();
-const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB max limit
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB max, per file and for a whole package
+const upload = multer({
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 5000, fieldSize: 5 * 1024 * 1024 }
+});
+const publishUpload = upload.fields([
+  { name: "file", maxCount: 1 }, // a ready-made .tgz
+  { name: "files", maxCount: 5000 } // loose files / a folder, packed into a .tgz here
+]);
 
 // GET /api/registry/search - Search packages
 router.get("/search", async (req, res) => {
@@ -144,7 +152,7 @@ router.get("/:name/-/:file", async (req, res) => {
 });
 
 // POST /api/registry/publish - Publish package (handles JSON base64 or Multipart form-data file)
-router.post("/publish", optionalAuthenticateToken, upload.single("file"), async (req, res) => {
+router.post("/publish", optionalAuthenticateToken, publishUpload, async (req, res) => {
   try {
     let { name, version, description, keywords, license, repository, homepage, readme, dependencies, fileBase64 } = req.body;
 
@@ -157,8 +165,35 @@ router.post("/publish", optionalAuthenticateToken, upload.single("file"), async 
 
     // Extract file buffer from multipart upload OR base64 payload
     let fileBuffer = Buffer.from("");
-    if (req.file && req.file.buffer) {
-      fileBuffer = req.file.buffer;
+    const tarballUpload = req.files?.file?.[0];
+    const looseFiles = req.files?.files ?? [];
+    if (looseFiles.length) {
+      // Loose files / a folder: `paths` carries each file's relative path, in upload order.
+      let paths = [];
+      try {
+        paths = JSON.parse(req.body.paths || "[]");
+      } catch {
+        return res.status(400).json({ error: "Invalid file paths." });
+      }
+
+      const entries = [];
+      let totalBytes = 0;
+      looseFiles.forEach((file, index) => {
+        const path = cleanPath(paths[index] ?? file.originalname);
+        if (!path) return;
+        totalBytes += file.buffer.length;
+        entries.push({ path, buffer: file.buffer });
+      });
+
+      if (!entries.length) {
+        return res.status(400).json({ error: "No usable files were selected." });
+      }
+      if (totalBytes > MAX_UPLOAD_BYTES) {
+        return res.status(400).json({ error: "The selected files are larger than 100 MB in total." });
+      }
+      fileBuffer = createTgz(entries);
+    } else if (tarballUpload && tarballUpload.buffer) {
+      fileBuffer = tarballUpload.buffer;
     } else if (fileBase64) {
       const cleanBase64 = fileBase64.includes(",") ? fileBase64.split(",")[1] : fileBase64;
       fileBuffer = Buffer.from(cleanBase64, "base64");
