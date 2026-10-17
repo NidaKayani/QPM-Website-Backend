@@ -162,6 +162,12 @@ async function getVersionFiles(name, version) {
   if (!pkg) return null;
   const v = await PackageVersion.findOne({ package: pkg._id, version });
   if (!v || !v.driveFileId) return null;
+  if (v.driveFileId.startsWith("drive_file_")) {
+    // Published before tarball storage worked: the archive was never saved.
+    const error = new Error("This version's files weren't saved when it was published. Publish a new version to browse its code.");
+    error.status = 410;
+    throw error;
+  }
 
   if (!extractedCache.has(v.driveFileId)) {
     const files = extractTgz(await downloadTarballFromDrive(v.driveFileId));
@@ -184,6 +190,7 @@ router.get("/:name/v/:version/files", async (req, res) => {
       files: files.map(({ path, buffer }) => ({ path, size: buffer.length }))
     });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error("List files error:", err);
     return res.status(500).json({ error: err.message || "Failed to read the package's files." });
   }
@@ -211,6 +218,7 @@ router.get("/:name/v/:version/file", async (req, res) => {
       content: binary || tooLarge ? null : file.buffer.toString("utf8")
     });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error("Read file error:", err);
     return res.status(500).json({ error: err.message || "Failed to read the file." });
   }
