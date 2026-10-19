@@ -321,6 +321,43 @@ router.get("/:name/v/:version/raw", noStore, async (req, res) => {
   }
 });
 
+const MAX_DESCRIPTION_LENGTH = 280;
+
+// PATCH /api/registry/:name - Edit a package's description (owner only)
+router.patch("/:name", authenticateToken, async (req, res) => {
+  try {
+    const name = req.params.name.toLowerCase();
+    const { description } = req.body ?? {};
+    if (typeof description !== "string") {
+      return res.status(400).json({ error: "A description is required." });
+    }
+    const cleanDescription = description.trim();
+    if (cleanDescription.length > MAX_DESCRIPTION_LENGTH) {
+      return res.status(400).json({ error: `The description can be at most ${MAX_DESCRIPTION_LENGTH} characters.` });
+    }
+
+    const pkg = await Package.findOne({ name });
+    if (!pkg) {
+      return res.status(404).json({ error: `Package "${name}" not found.` });
+    }
+    if (!pkg.owner || pkg.owner.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: `Only the owner of "${name}" can edit it.` });
+    }
+
+    pkg.description = cleanDescription;
+    // Editing details isn't a publish, so it mustn't move "updated" dates or search order.
+    await pkg.save({ timestamps: false });
+
+    return res.json({
+      message: `Updated the description of "${name}".`,
+      package: { name: pkg.name, description: pkg.description }
+    });
+  } catch (err) {
+    console.error("Edit package error:", err);
+    return res.status(500).json({ error: err.message || "Failed to update package." });
+  }
+});
+
 // DELETE /api/registry/:name - Delete a package, every version, and their stored tarballs (owner only)
 router.delete("/:name", authenticateToken, async (req, res) => {
   try {
@@ -430,10 +467,13 @@ router.post("/publish", optionalAuthenticateToken, publishUpload, async (req, re
     let existingPkg = await Package.findOne({ name });
     const currentUserId = req.user ? req.user._id : null;
 
-    if (existingPkg && existingPkg.owner && currentUserId) {
-      if (existingPkg.owner.toString() !== currentUserId.toString()) {
-        return res.status(403).json({ error: `Package "${name}" belongs to another author.` });
-      }
+    // An owned package only takes new versions from its owner; guests can't publish over it.
+    if (existingPkg && existingPkg.owner && existingPkg.owner.toString() !== currentUserId?.toString()) {
+      return res.status(403).json({
+        error: currentUserId
+          ? `Package "${name}" belongs to another author.`
+          : `Package "${name}" has an owner. Sign in as them to publish a new version.`
+      });
     }
 
     if (!existingPkg) {
@@ -571,10 +611,13 @@ router.post("/publish-from-github", optionalAuthenticateToken, async (req, res) 
     let existingPkg = await Package.findOne({ name });
     const currentUserId = req.user ? req.user._id : null;
 
-    if (existingPkg && existingPkg.owner && currentUserId) {
-      if (existingPkg.owner.toString() !== currentUserId.toString()) {
-        return res.status(403).json({ error: `Package "${name}" belongs to another author.` });
-      }
+    // An owned package only takes new versions from its owner; guests can't publish over it.
+    if (existingPkg && existingPkg.owner && existingPkg.owner.toString() !== currentUserId?.toString()) {
+      return res.status(403).json({
+        error: currentUserId
+          ? `Package "${name}" belongs to another author.`
+          : `Package "${name}" has an owner. Sign in as them to publish a new version.`
+      });
     }
 
     if (!existingPkg) {

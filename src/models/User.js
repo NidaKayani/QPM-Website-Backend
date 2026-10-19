@@ -29,6 +29,11 @@ const userSchema = new mongoose.Schema(
     avatarUrl: {
       type: String,
       default: ""
+    },
+    // Bumped by "Regenerate token"; an API token is only valid for the version it was issued under.
+    apiTokenVersion: {
+      type: Number,
+      default: 0
     }
   },
   {
@@ -39,6 +44,7 @@ const userSchema = new mongoose.Schema(
 userSchema.set("toJSON", {
   transform: (doc, ret) => {
     delete ret.passwordHash;
+    delete ret.apiTokenVersion;
     return ret;
   }
 });
