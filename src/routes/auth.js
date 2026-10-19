@@ -1,8 +1,8 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { User } from "../models/User.js";
 import { authenticateToken } from "../middleware/auth.js";
+import { signApiToken, signSessionToken } from "../services/tokens.js";
 
 const router = Router();
 
@@ -41,10 +41,7 @@ router.post("/signup", async (req, res) => {
 
     await user.save();
 
-    const jwtSecret = process.env.JWT_SECRET || "quantum_package_manager_super_secret_jwt_key_2026";
-    const token = jwt.sign({ id: user._id, username: user.username, email: user.email }, jwtSecret, {
-      expiresIn: "7d"
-    });
+    const token = signSessionToken(user);
 
     return res.status(201).json({
       message: "User registered successfully",
@@ -86,10 +83,7 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    const jwtSecret = process.env.JWT_SECRET || "quantum_package_manager_super_secret_jwt_key_2026";
-    const token = jwt.sign({ id: user._id, username: user.username, email: user.email }, jwtSecret, {
-      expiresIn: "7d"
-    });
+    const token = signSessionToken(user);
 
     return res.json({
       message: "Login successful",
@@ -116,6 +110,28 @@ router.get("/me", authenticateToken, async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ error: err.message || "Failed to fetch user profile." });
+  }
+});
+
+// GET /api/auth/api-token - The account's API token for `qpm login` and scripts (doesn't expire)
+router.get("/api-token", authenticateToken, (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  return res.json({ token: signApiToken(req.user) });
+});
+
+// POST /api/auth/api-token - Regenerate the API token; every earlier one stops working
+router.post("/api-token", authenticateToken, async (req, res) => {
+  try {
+    // A leaked API token mustn't be able to lock the owner out by regenerating it.
+    if (req.tokenKind === "api") {
+      return res.status(403).json({ error: "Sign in on the website to regenerate your API token." });
+    }
+    const user = await User.findByIdAndUpdate(req.user._id, { $inc: { apiTokenVersion: 1 } }, { new: true });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ token: signApiToken(user) });
+  } catch (err) {
+    console.error("API token error:", err);
+    return res.status(500).json({ error: err.message || "Failed to regenerate the API token." });
   }
 });
 
