@@ -322,18 +322,41 @@ router.get("/:name/v/:version/raw", noStore, async (req, res) => {
 });
 
 const MAX_DESCRIPTION_LENGTH = 280;
+const MAX_KEYWORDS = 20;
+const MAX_KEYWORD_LENGTH = 50;
 
-// PATCH /api/registry/:name - Edit a package's description (owner only)
+// PATCH /api/registry/:name - Edit a package's description and/or keywords (owner only)
 router.patch("/:name", authenticateToken, async (req, res) => {
   try {
     const name = req.params.name.toLowerCase();
-    const { description } = req.body ?? {};
-    if (typeof description !== "string") {
-      return res.status(400).json({ error: "A description is required." });
+    let { description, keywords } = req.body ?? {};
+    if (description === undefined && keywords === undefined) {
+      return res.status(400).json({ error: "Send a description or keywords to update." });
     }
-    const cleanDescription = description.trim();
-    if (cleanDescription.length > MAX_DESCRIPTION_LENGTH) {
-      return res.status(400).json({ error: `The description can be at most ${MAX_DESCRIPTION_LENGTH} characters.` });
+
+    if (description !== undefined) {
+      if (typeof description !== "string") {
+        return res.status(400).json({ error: "The description must be text." });
+      }
+      description = description.trim();
+      if (description.length > MAX_DESCRIPTION_LENGTH) {
+        return res.status(400).json({ error: `The description can be at most ${MAX_DESCRIPTION_LENGTH} characters.` });
+      }
+    }
+
+    if (keywords !== undefined) {
+      if (typeof keywords === "string") keywords = keywords.split(",");
+      if (!Array.isArray(keywords) || keywords.some((k) => typeof k !== "string")) {
+        return res.status(400).json({ error: "Keywords must be a list of words." });
+      }
+      keywords = [...new Set(keywords.map((k) => k.trim().toLowerCase()).filter(Boolean))];
+      if (keywords.length > MAX_KEYWORDS) {
+        return res.status(400).json({ error: `A package can have at most ${MAX_KEYWORDS} keywords.` });
+      }
+      const tooLong = keywords.find((k) => k.length > MAX_KEYWORD_LENGTH);
+      if (tooLong) {
+        return res.status(400).json({ error: `Keywords can be at most ${MAX_KEYWORD_LENGTH} characters ("${tooLong}" is too long).` });
+      }
     }
 
     const pkg = await Package.findOne({ name });
@@ -344,13 +367,14 @@ router.patch("/:name", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: `Only the owner of "${name}" can edit it.` });
     }
 
-    pkg.description = cleanDescription;
+    if (description !== undefined) pkg.description = description;
+    if (keywords !== undefined) pkg.keywords = keywords;
     // Editing details isn't a publish, so it mustn't move "updated" dates or search order.
     await pkg.save({ timestamps: false });
 
     return res.json({
-      message: `Updated the description of "${name}".`,
-      package: { name: pkg.name, description: pkg.description }
+      message: `Updated "${name}".`,
+      package: { name: pkg.name, description: pkg.description, keywords: pkg.keywords }
     });
   } catch (err) {
     console.error("Edit package error:", err);
