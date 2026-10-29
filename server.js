@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { connectDB, dbStatus } from "./src/config/db.js";
 import authRouter from "./src/routes/auth.js";
 import registryRouter from "./src/routes/registry.js";
+import compilerRouter from "./src/routes/compiler.js";
 
 dotenv.config();
 
@@ -29,6 +30,9 @@ app.get("/api/health", async (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// Compiler releases (`quantum update`): Google Drive only, no database needed
+app.use("/api/compiler", compilerRouter);
 
 // Every other API route needs the database; answer fast instead of buffering queries.
 app.use("/api", (req, res, next) => {

@@ -131,6 +131,78 @@ export async function downloadTarballFromDrive(fileId) {
   return Buffer.from(arrayBuffer);
 }
 
+// ── Compiler releases ────────────────────────────────────────────────────
+// A Drive folder (GOOGLE_DRIVE_COMPILER_FOLDER_ID) holds the newest Quantum
+// build: quantum.exe, qrun.exe, quantum_stub.exe, qpm.exe and version.sa.
+// Without Drive credentials the same files are read from backend/storage/compiler/.
+
+const LOCAL_COMPILER_DIR = path.join(LOCAL_DIR, "compiler");
+const LOCAL_COMPILER_PREFIX = "localcompiler_";
+
+/**
+ * The files of the compiler release folder: [{ id, name, size }].
+ */
+export async function listCompilerFiles() {
+  const token = await getAccessToken();
+  const folderId = process.env.GOOGLE_DRIVE_COMPILER_FOLDER_ID;
+
+  if (!token || !folderId) {
+    let names = [];
+    try {
+      names = await fs.readdir(LOCAL_COMPILER_DIR);
+    } catch {
+      return [];
+    }
+    const files = [];
+    for (const name of names) {
+      const stat = await fs.stat(path.join(LOCAL_COMPILER_DIR, name));
+      if (stat.isFile()) files.push({ id: `${LOCAL_COMPILER_PREFIX}${name}`, name, size: stat.size });
+    }
+    return files;
+  }
+
+  const files = [];
+  let pageToken = "";
+  do {
+    const params = new URLSearchParams({
+      q: `'${folderId}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'`,
+      fields: "nextPageToken, files(id, name, size)",
+      pageSize: "100",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      throw new Error(`Google Drive listing failed (${res.status}): ${await res.text()}`);
+    }
+    const data = await res.json();
+    for (const f of data.files || []) {
+      files.push({ id: f.id, name: f.name, size: Number(f.size || 0) });
+    }
+    pageToken = data.nextPageToken || "";
+  } while (pageToken);
+  return files;
+}
+
+/**
+ * One file of the compiler release folder, by the id listCompilerFiles gave.
+ */
+export async function downloadCompilerFile(fileId) {
+  if (fileId.startsWith(LOCAL_COMPILER_PREFIX)) {
+    return fs.readFile(path.join(LOCAL_COMPILER_DIR, path.basename(fileId.slice(LOCAL_COMPILER_PREFIX.length))));
+  }
+  const token = await getAccessToken();
+  if (!token) throw new Error("Google Drive credentials are not configured");
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to download file from Google Drive (${res.status})`);
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+
 /**
  * Deletes a tarball file from Google Drive.
  */
